@@ -3,11 +3,14 @@ import {
   BeaconWallet,
   BeaconWalletNotInitialized,
   MissingRequiredScopes,
+  NetworkNotGrantedError,
+  UnmappedNetworkError,
 } from '../src/taquito-beacon-wallet';
 import LocalStorageMock from './mock-local-storage';
 import {
   PermissionScope,
   LocalStorage,
+  NetworkType,
   SigningType,
   getDAppClientInstance,
   Regions,
@@ -30,16 +33,18 @@ vi.mock('@stablelib/random', () => ({
 }));
 
 vi.mock('@tezos-x/octez.connect-dapp', async () => {
-  const originalModule =
-    await vi.importActual<typeof import('@tezos-x/octez.connect-dapp')>(
-      '@tezos-x/octez.connect-dapp'
-    );
+  const originalModule = await vi.importActual<typeof import('@tezos-x/octez.connect-dapp')>(
+    '@tezos-x/octez.connect-dapp'
+  );
 
   return {
     ...originalModule,
     getDAppClientInstance: vi.fn().mockImplementation(() => ({
       requestPermissions: vi.fn(),
       getActiveAccount: vi.fn(),
+      getAccounts: vi.fn().mockResolvedValue([]),
+      setActiveAccount: vi.fn().mockResolvedValue(undefined),
+      requestOperation: vi.fn().mockResolvedValue({ transactionHash: 'op-hash' }),
       showPrepare: vi.fn(),
       hideUI: vi.fn(),
       disconnect: vi.fn().mockResolvedValue(undefined),
@@ -276,5 +281,121 @@ describe('Beacon Wallet tests', () => {
   it('Verify sign throws for Raw', async () => {
     const wallet = new BeaconWallet({ name: 'Test', storage: new LocalStorage() });
     expect(async () => await wallet.sign('48656C6C6F20576F726C64')).rejects.toThrow();
+  });
+
+  describe('multi-network', () => {
+    const MAINNET_CHAIN_ID = 'tezos:NetXdQprcVkpaWU';
+    const GHOSTNET_CHAIN_ID = 'tezos:NetXnHfVqm9iesp';
+
+    const account = (chainId?: string, address = 'tz1testaddress') =>
+      ({
+        address,
+        publicKey: 'edpktestpublickey',
+        scopes: [PermissionScope.OPERATION_REQUEST, PermissionScope.SIGN],
+        network: chainId
+          ? { type: NetworkType.CUSTOM, name: chainId, chainId }
+          : { type: 'ghostnet' },
+      }) as any;
+
+    const walletWithAccounts = (accounts: any[], active = accounts[0]) => {
+      const wallet = new BeaconWallet({ name: 'Test' });
+      (wallet.client.getAccounts as any).mockResolvedValue(accounts);
+      (wallet.client.getActiveAccount as any).mockResolvedValue(active);
+      return wallet;
+    };
+
+    it('forwards the requested networks to the Beacon client', async () => {
+      const wallet = new BeaconWallet({ name: 'Test' });
+      const networks = [{ chainId: MAINNET_CHAIN_ID }, { chainId: GHOSTNET_CHAIN_ID }];
+
+      await wallet.requestPermissions({ networks });
+
+      expect(wallet.client.requestPermissions).toHaveBeenCalledWith({ networks });
+    });
+
+    it('lists the granted networks of a multi-network session', async () => {
+      const wallet = walletWithAccounts([
+        account(MAINNET_CHAIN_ID),
+        account(GHOSTNET_CHAIN_ID),
+        // A second account on an already-granted network must not be listed twice
+        account(GHOSTNET_CHAIN_ID, 'tz1otheraddress'),
+      ]);
+
+      expect(await wallet.getGrantedNetworks()).toEqual([MAINNET_CHAIN_ID, GHOSTNET_CHAIN_ID]);
+    });
+
+    it('lists no granted network for a session without chain ids', async () => {
+      const wallet = walletWithAccounts([account()]);
+
+      expect(await wallet.getGrantedNetworks()).toEqual([]);
+    });
+
+    it('returns the network of the active account', async () => {
+      const wallet = walletWithAccounts([account(GHOSTNET_CHAIN_ID)]);
+
+      expect((await wallet.getActiveNetwork())?.chainId).toEqual(GHOSTNET_CHAIN_ID);
+    });
+
+    it('selects the granted account of a network addressed by NetworkType', async () => {
+      const accounts = [account(MAINNET_CHAIN_ID), account(GHOSTNET_CHAIN_ID)];
+      const wallet = walletWithAccounts(accounts);
+
+      const selected = await wallet.setActiveNetwork(NetworkType.GHOSTNET);
+
+      expect(selected).toBe(accounts[1]);
+      expect(wallet.client.setActiveAccount).toHaveBeenCalledWith(accounts[1]);
+    });
+
+    it('selects the granted account of a network addressed by chain id', async () => {
+      const accounts = [account(MAINNET_CHAIN_ID), account(GHOSTNET_CHAIN_ID)];
+      const wallet = walletWithAccounts(accounts);
+
+      // Bare chain ids are accepted alongside the prefixed CAIP-2 form
+      await wallet.setActiveNetwork('NetXnHfVqm9iesp');
+
+      expect(wallet.client.setActiveAccount).toHaveBeenCalledWith(accounts[1]);
+    });
+
+    it('throws when the wallet granted no account on the selected network', async () => {
+      const wallet = walletWithAccounts([account(MAINNET_CHAIN_ID)]);
+
+      await expect(wallet.setActiveNetwork(NetworkType.GHOSTNET)).rejects.toThrow(
+        NetworkNotGrantedError
+      );
+      expect(wallet.client.setActiveAccount).not.toHaveBeenCalled();
+    });
+
+    it('throws when a network has no statically known chain id', async () => {
+      const wallet = walletWithAccounts([account(MAINNET_CHAIN_ID)]);
+
+      await expect(wallet.setActiveNetwork(NetworkType.WEEKLYNET)).rejects.toThrow(
+        UnmappedNetworkError
+      );
+    });
+
+    it('routes operations to the network of the active account', async () => {
+      const wallet = walletWithAccounts(
+        [account(MAINNET_CHAIN_ID), account(GHOSTNET_CHAIN_ID)],
+        account(GHOSTNET_CHAIN_ID)
+      );
+
+      const hash = await wallet.sendOperations([{ kind: 'transaction' }]);
+
+      expect(wallet.client.requestOperation).toHaveBeenCalledWith({
+        operationDetails: [{ kind: 'transaction' }],
+        network: GHOSTNET_CHAIN_ID,
+      });
+      expect(hash).toEqual('op-hash');
+    });
+
+    it('sends operations without a network on a session that carries no chain id', async () => {
+      const wallet = walletWithAccounts([account()]);
+
+      await wallet.sendOperations([{ kind: 'transaction' }]);
+
+      expect(wallet.client.requestOperation).toHaveBeenCalledWith({
+        operationDetails: [{ kind: 'transaction' }],
+      });
+    });
   });
 });

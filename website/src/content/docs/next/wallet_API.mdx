@@ -126,6 +126,55 @@ try {
 }
 ```
 
+### Connecting to several networks at once
+
+A single pairing can grant your dApp accounts on more than one network — for example mainnet and ghostnet — so users pair the wallet once and switch networks inside your UI without re-scanning a QR code.
+
+Networks are addressed by their [CAIP-2](https://github.com/ChainAgnostic/CAIPs/blob/main/CAIPs/caip-2.md) chain id (`tezos:<genesis block hash>`). Taquito re-exports `tezosCaip2FromNetworkType` to derive it from a `NetworkType`:
+
+```ts
+import { BeaconWallet, tezosCaip2FromNetworkType } from '@taquito/beacon-wallet';
+import { NetworkType } from '@taquito/beacon-wallet/types';
+
+const wallet = new BeaconWallet({
+  name: 'MyAwesomeDapp',
+  network: { type: NetworkType.MAINNET },
+});
+
+await wallet.requestPermissions({
+  networks: [
+    { chainId: tezosCaip2FromNetworkType(NetworkType.MAINNET)! },
+    { chainId: tezosCaip2FromNetworkType(NetworkType.GHOSTNET)! },
+  ],
+});
+```
+
+`tezosCaip2FromNetworkType` returns `undefined` for networks whose genesis block is not statically known (`weeklynet`, `dailynet`, `custom`, and networks without a public RPC) — those must be requested by their chain id directly.
+
+The wallet grants one account per network. `getGrantedNetworks()` lists what it actually granted, and `setActiveNetwork()` chooses which of those accounts signs and sends subsequent operations:
+
+```ts
+await wallet.getGrantedNetworks();
+// ['tezos:NetXdQprcVkpaWU', 'tezos:NetXnHfVqm9iesp']
+
+await wallet.setActiveNetwork(NetworkType.GHOSTNET);
+await wallet.getPKH(); // the address the wallet granted on ghostnet
+```
+
+`setActiveNetwork()` also accepts a chain id directly (`'tezos:NetXnHfVqm9iesp'`), which is how you reach a network that has no `NetworkType` mapping. It does not re-pair the wallet, and it throws `NetworkNotGrantedError` if the wallet granted no account on that network.
+
+The RPC node your `TezosToolkit` talks to is not part of the wallet session, so switch it yourself when the active network changes:
+
+```ts
+await wallet.setActiveNetwork(NetworkType.GHOSTNET);
+Tezos.setRpcProvider('https://rpc.ghostnet.teztnets.com');
+```
+
+Other accounts remain available for inspection through `getAccounts()`, and `getActiveNetwork()` returns the network of the active one.
+
+>[!NOTE]
+> Multi-network requires a wallet built on Octez Connect v5 or later. Older wallets ignore the `networks` list and grant a single account on their own configured network, which keeps working exactly as before. If your dApp cannot function that way, pass `requiredMinimumVersion: '4'` when constructing the `BeaconWallet` — incompatible wallets are then rejected with a `VersionUnsupportedBeaconError` instead of silently degrading to one network.
+
 ### Subscribing to events
 
 While your dApp is connected to the wallet, different events can happen on the wallet side. A reactive dApp can subscribe to these events and update the UI to create a good user experience.
